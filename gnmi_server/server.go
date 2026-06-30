@@ -202,6 +202,7 @@ type DebugServer struct {
 // for forward compatibility
 type HealthzServer struct {
 	*Server
+	artifactResolver artifactPathResolver
 	gnoi_healthz_pb.UnimplementedHealthzServer
 }
 
@@ -358,13 +359,16 @@ func registerAllServices(s *grpc.Server, srv *Server, fileSrv *FileServer,
 	gnsi_pathz_pb.RegisterPathzServer(s, pathzSrv)
 	gnsi_credentialz_pb.RegisterCredentialzServer(s, credentialzSrv)
 	spb_jwt_gnoi.RegisterSonicJwtServiceServer(s, srv)
+	// Keep Healthz registered so existing-artifact reads remain available when
+	// gNMI Set support is disabled. Handlers independently gate Acknowledge,
+	// Check, and the legacy Get path that starts a new host-side collection.
+	gnoi_healthz_pb.RegisterHealthzServer(s, healthzSrv)
 	if srv.config.EnableTranslibWrite || srv.config.EnableNativeWrite {
 		gnoi_system_pb.RegisterSystemServer(s, srv)
 		gnoi_file_pb.RegisterFileServer(s, fileSrv)
 		gnoi_os_pb.RegisterOSServer(s, osSrv)
 		gnoi_containerz_pb.RegisterContainerzServer(s, containerzSrv)
 		gnoi_debug_pb.RegisterDebugServer(s, debugSrv)
-		gnoi_healthz_pb.RegisterHealthzServer(s, healthzSrv)
 	}
 	// ORAS Pull writes only into an allowlisted staging area inside the
 	// container; it has no relation to the gNMI write paths, so it is not
@@ -817,40 +821,6 @@ func authenticate(config *Config, ctx context.Context, target string, writeAcces
 		if err == nil {
 			success = true
 		}
-		// role must be readwrite to support write access
-		if success && config.ConfigTableName != "" {
-			match := false
-			target = strings.ToLower(target)
-			for _, role := range rc.Auth.Roles {
-				role = strings.TrimSpace(role)
-				if strings.HasPrefix(role, target) {
-					// Extract the postfix from the role
-					// e.g. role=gnmi_config_db_readwrite
-					// e.g. role=gnoi_readonly
-					postfix := strings.TrimPrefix(role, target)
-					postfix = strings.TrimPrefix(postfix, "_")
-					// Check if the role postfix indicates no access, and deny access if true.
-					if postfix == NoAccessMode {
-						return ctx, fmt.Errorf("%s does not have access, target %s, role %s", rc.Auth.User, target, role)
-					} else if postfix == ReadOnlyMode {
-						// ReadOnlyMode is allowed for read access
-						if writeAccess {
-							return ctx, fmt.Errorf("%s does not have access, target %s, role %s", rc.Auth.User, target, role)
-						} else {
-							match = true
-							break
-						}
-					} else if postfix == WriteAccessMode {
-						// WriteAccessMode is allowed for read/write access
-						match = true
-						break
-					}
-				}
-			}
-			if !match && writeAccess {
-				return ctx, fmt.Errorf("%s does not have write access, target %s", rc.Auth.User, target)
-			}
-		}
 	}
 
 	//Allow for future authentication mechanisms here...
@@ -858,9 +828,43 @@ func authenticate(config *Config, ctx context.Context, target string, writeAcces
 	if !success {
 		return ctx, status.Error(codes.Unauthenticated, "Unauthenticated")
 	}
+	if err := authorizeTargetRoles(rc, target, writeAccess); err != nil {
+		return ctx, err
+	}
 	log.V(5).Infof("authenticate user %v, roles %v", rc.Auth.User, rc.Auth.Roles)
 
 	return ctx, nil
+}
+
+// authorizeTargetRoles applies target authorization after any configured
+// authentication mechanism succeeds. Reads preserve the historical behavior
+// of allowing users with no target-specific role, but an explicit noaccess role
+// always wins. Writes require an explicit target readwrite role.
+func authorizeTargetRoles(rc *common_utils.RequestContext, target string, writeAccess bool) error {
+	target = strings.ToLower(strings.TrimSpace(target))
+	hasReadWrite := false
+	for _, configuredRole := range rc.Auth.Roles {
+		role := strings.ToLower(strings.TrimSpace(configuredRole))
+		if !strings.HasPrefix(role, target) {
+			continue
+		}
+
+		postfix := strings.TrimPrefix(role, target)
+		postfix = strings.TrimPrefix(postfix, "_")
+		switch postfix {
+		case NoAccessMode:
+			return status.Errorf(codes.PermissionDenied,
+				"%s does not have access, target %s, role %s", rc.Auth.User, target, configuredRole)
+		case WriteAccessMode:
+			hasReadWrite = true
+		}
+	}
+
+	if writeAccess && !hasReadWrite {
+		return status.Errorf(codes.PermissionDenied,
+			"%s does not have write access, target %s", rc.Auth.User, target)
+	}
+	return nil
 }
 
 // Subscribe implements the gNMI Subscribe RPC.
