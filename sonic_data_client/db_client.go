@@ -382,7 +382,45 @@ func (c *DbClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sync.W
 }
 
 func (c *DbClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
-	return
+	c.w = w
+	defer c.w.Done()
+	c.q = q
+	c.channel = once
+
+	_, more := <-c.channel
+	if !more {
+		log.V(1).Infof("%v once channel closed, exiting OnceRun routine", c)
+		return
+	}
+
+	t1 := time.Now()
+	for gnmiPath, tblPaths := range c.pathG2S {
+		val, err, updateReceived := subscribeTableData2TypedValue(tblPaths, nil)
+		if err != nil {
+			log.V(2).Infof("OnceRun: Unable to create gnmi TypedValue due to err: %v", err)
+			putFatalMsg(c.q, fmt.Sprintf("OnceRun error: %v", err))
+			return
+		}
+		if updateReceived {
+			spbv := &spb.Value{
+				Prefix:       c.prefix,
+				Path:         gnmiPath,
+				Timestamp:    time.Now().UnixNano(),
+				SyncResponse: false,
+				Val:          val,
+			}
+			c.q.Put(Value{spbv})
+			log.V(6).Infof("OnceRun: Added spbv #%v", spbv)
+		}
+	}
+
+	c.q.Put(Value{
+		&spb.Value{
+			Timestamp:    time.Now().UnixNano(),
+			SyncResponse: true,
+		},
+	})
+	log.V(4).Infof("OnceRun: Sync done, total time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
 }
 func (c *DbClient) Get(w *sync.WaitGroup) ([]*spb.Value, error) {
 	// wait sync for Get, not used for now
@@ -574,6 +612,28 @@ func init() {
 }
 
 func initRedisDbClients() {
+	// Build the set of DBs present in the runtime database_config.json so
+	// we can skip DBs absent on this platform before calling GetDbSock, which would otherwise
+	// log ERR for every missing DB.
+	// Note: GetDbList always returns the default namespace DB list.
+	// This is safe because all namespaces carry the same DB names; they differ only in
+	// socket paths. GetDbList and GetDbAllNamespaces share the same DbInit gate,
+	// so if GetDbList fails GetDbAllNamespaces would fail too;
+	// returning early here avoids redundant failures.
+	runtimeDbList, err := sdcfg.GetDbList(sdcfg.SONIC_DEFAULT_NAMESPACE)
+	if err != nil {
+		log.Errorf("initRedisDbClients: failed to get runtime DB list: %v", err)
+		return
+	}
+	if len(runtimeDbList) == 0 {
+		log.Errorf("initRedisDbClients: runtime DB list is empty, database config may be corrupt")
+		return
+	}
+	runtimeDbSet := make(map[string]struct{}, len(runtimeDbList))
+	for _, db := range runtimeDbList {
+		runtimeDbSet[db] = struct{}{}
+	}
+
 	AllNamespaces, err := sdcfg.GetDbAllNamespaces()
 	if err != nil {
 		log.Errorf("init error:  %v", err)
@@ -583,6 +643,13 @@ func initRedisDbClients() {
 		Target2RedisDb[dbNamespace] = make(map[string]*redis.Client)
 		for dbName, dbn := range spb.Target_value {
 			if dbName != "OTHERS" {
+				// Skip DBs not present in the runtime database_config.json.
+				// runtimeDbSet is non-empty here (guaranteed by the early return
+				// above), so a missing key safely returns false in Go.
+				if _, ok := runtimeDbSet[dbName]; !ok {
+					log.V(2).Infof("initRedisDbClients: skipping %s, not in runtime DB config", dbName)
+					continue
+				}
 				addr, err := sdcfg.GetDbSock(dbName, dbNamespace)
 				if err != nil {
 					log.Warningf("Skipping %s in namespace %s: %v", dbName, dbNamespace, err)

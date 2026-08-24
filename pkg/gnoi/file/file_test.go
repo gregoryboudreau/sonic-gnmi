@@ -27,6 +27,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func transferTestPath(t *testing.T, name string) (logical, physical string) {
+	t.Helper()
+	logicalDir, physicalDir := useTempHostRoot(t)
+	return filepath.Join(logicalDir, name), filepath.Join(physicalDir, name)
+}
+
 func TestHandleTransferToRemote_Success(t *testing.T) {
 	// Create test HTTP server
 	testContent := []byte("test firmware content")
@@ -36,9 +42,7 @@ func TestHandleTransferToRemote_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Create temp directory for output
-	tempDir := t.TempDir()
-	localPath := filepath.Join(tempDir, "firmware.bin")
+	localPath, physicalPath := transferTestPath(t, "firmware.bin")
 
 	// Create request
 	req := &gnoi_file_pb.TransferToRemoteRequest{
@@ -70,7 +74,7 @@ func TestHandleTransferToRemote_Success(t *testing.T) {
 	}
 
 	// Verify file was downloaded
-	content, err := os.ReadFile(localPath)
+	content, err := os.ReadFile(physicalPath)
 	if err != nil {
 		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
@@ -139,9 +143,9 @@ func TestHandleTransferToRemote_EmptyLocalPath(t *testing.T) {
 }
 
 func TestHandleTransferToRemote_EmptyURL(t *testing.T) {
-	tempDir := t.TempDir()
+	localPath, _ := transferTestPath(t, "test.bin")
 	req := &gnoi_file_pb.TransferToRemoteRequest{
-		LocalPath: filepath.Join(tempDir, "test.bin"),
+		LocalPath: localPath,
 		RemoteDownload: &common.RemoteDownload{
 			Path:     "",
 			Protocol: common.RemoteDownload_HTTP,
@@ -161,9 +165,9 @@ func TestHandleTransferToRemote_EmptyURL(t *testing.T) {
 }
 
 func TestHandleTransferToRemote_UnsupportedProtocol(t *testing.T) {
-	tempDir := t.TempDir()
+	localPath, _ := transferTestPath(t, "test.bin")
 	req := &gnoi_file_pb.TransferToRemoteRequest{
-		LocalPath: filepath.Join(tempDir, "test.bin"),
+		LocalPath: localPath,
 		RemoteDownload: &common.RemoteDownload{
 			Path:     "https://example.com/file",
 			Protocol: common.RemoteDownload_HTTPS,
@@ -189,9 +193,9 @@ func TestHandleTransferToRemote_DownloadFails(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tempDir := t.TempDir()
+	localPath, _ := transferTestPath(t, "test.bin")
 	req := &gnoi_file_pb.TransferToRemoteRequest{
-		LocalPath: filepath.Join(tempDir, "test.bin"),
+		LocalPath: localPath,
 		RemoteDownload: &common.RemoteDownload{
 			Path:     server.URL,
 			Protocol: common.RemoteDownload_HTTP,
@@ -221,8 +225,7 @@ func TestHandleTransferToRemote_HashVerification(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tempDir := t.TempDir()
-	localPath := filepath.Join(tempDir, "test.txt")
+	localPath, _ := transferTestPath(t, "test.txt")
 
 	req := &gnoi_file_pb.TransferToRemoteRequest{
 		LocalPath: localPath,
@@ -254,9 +257,7 @@ func TestHandleTransferToRemote_NestedDirectories(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tempDir := t.TempDir()
-	// Path with nested directories
-	localPath := filepath.Join(tempDir, "a", "b", "c", "file.bin")
+	localPath, physicalPath := transferTestPath(t, filepath.Join("a", "b", "c", "file.bin"))
 
 	req := &gnoi_file_pb.TransferToRemoteRequest{
 		LocalPath: localPath,
@@ -273,7 +274,7 @@ func TestHandleTransferToRemote_NestedDirectories(t *testing.T) {
 	}
 
 	// Verify file was created
-	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+	if _, err := os.Stat(physicalPath); os.IsNotExist(err) {
 		t.Error("File was not created in nested directory")
 	}
 }
@@ -328,9 +329,9 @@ func TestHandleTransferToRemote_ContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tempDir := t.TempDir()
+	localPath, _ := transferTestPath(t, "test.bin")
 	req := &gnoi_file_pb.TransferToRemoteRequest{
-		LocalPath: filepath.Join(tempDir, "test.bin"),
+		LocalPath: localPath,
 		RemoteDownload: &common.RemoteDownload{
 			Path:     server.URL,
 			Protocol: common.RemoteDownload_HTTP,
@@ -1677,9 +1678,9 @@ func TestHandleTransferToRemote_EdgeCases(t *testing.T) {
 		}))
 		defer server.Close()
 
-		tempDir := t.TempDir()
+		localPath, _ := transferTestPath(t, "large.bin")
 		req := &gnoi_file_pb.TransferToRemoteRequest{
-			LocalPath: filepath.Join(tempDir, "large.bin"),
+			LocalPath: localPath,
 			RemoteDownload: &common.RemoteDownload{
 				Path:     server.URL,
 				Protocol: common.RemoteDownload_HTTP,
@@ -1706,9 +1707,9 @@ func TestHandleTransferToRemote_EdgeCases(t *testing.T) {
 		}))
 		defer slowServer.Close()
 
-		tempDir := t.TempDir()
+		localPath, _ := transferTestPath(t, "timeout.bin")
 		req := &gnoi_file_pb.TransferToRemoteRequest{
-			LocalPath: filepath.Join(tempDir, "timeout.bin"),
+			LocalPath: localPath,
 			RemoteDownload: &common.RemoteDownload{
 				Path:     slowServer.URL,
 				Protocol: common.RemoteDownload_HTTP,
@@ -2076,9 +2077,9 @@ func TestHandleTransferToRemote_HighCoverage(t *testing.T) {
 		}))
 		defer server.Close()
 
-		tempDir := t.TempDir()
+		localPath, _ := transferTestPath(t, "cleanup_test.bin")
 		req := &gnoi_file_pb.TransferToRemoteRequest{
-			LocalPath: filepath.Join(tempDir, "cleanup_test.bin"),
+			LocalPath: localPath,
 			RemoteDownload: &common.RemoteDownload{
 				Path:     server.URL,
 				Protocol: common.RemoteDownload_HTTP,
